@@ -21,6 +21,7 @@ import volatility.obj as obj
 import volatility.debug as debug
 import volatility.plugins.linux.pslist as linux_pslist
 import volatility.utils as utils
+import socket
 
 class linux_rosnode(linux_pslist.linux_pslist):
     """
@@ -35,6 +36,8 @@ class linux_rosnode(linux_pslist.linux_pslist):
     def calculate(self):
         """
         Return tasks that correspond with ROS nodes
+            - detects nodes by checking libxmlrpcpp or librosconsole libs in processes
+            - marks those unregistered nodes according to the assumptions below
         """
         # Build a list of tasks
         tasks = linux_pslist.linux_pslist.calculate(self)
@@ -48,15 +51,45 @@ class linux_rosnode(linux_pslist.linux_pslist):
                     # libxmlrcpcpp or librosconsole
                     if "libxmlrpcpp.so" in mapping.l_name or \
                         "librosconsole.so" in mapping.l_name:
-                        # select each task only once
+                        # select each task only once and check if unregistered
                         if t in nodes:
                             continue
                         else:
-                            yield t
+                            # The following assumption is made for detecting unregistered nodes:
+                            #
+                            #     a publisher having a socket in the same port both in
+                            #     `LISTEN` and `CLOSE_WAIT` status was likely unregistered
+                            #
+                            # WARNING: this assumption was validated for a simple scenario. Further
+                            # research needs to be executed to validate it in multi-topic and
+                            # multi-nodes scenarios.
+                            listen_ports = [] # ports with LISTEN state
+                            close_wait_ports = [] # ports with CLOSE_WAIT state
+                            for ents in t.netstat():
+                                if ents[0] == socket.AF_INET:
+                                    (_, proto, saddr, sport, daddr, dport, state) = ents[1]
+                                    if state == 'LISTEN':
+                                        listen_ports.append(sport)
+                                    elif state == 'CLOSE_WAIT':
+                                        close_wait_ports.append(sport)
+
+                                # # not considering unix sockets since ROS does not use them
+                                # elif ents[0] == 1 and not self._config.IGNORE_UNIX:
+                                #     (name, inum) = ents[1]
+                                #     print("UNIX {0:<8d} {1:>17s}/{2:<5d} {3:s}".format(inum, t.comm, t.pid, name))
+                                #     # outfd.write("UNIX {0:<8d} {1:>17s}/{2:<5d} {3:s}".format(inum, t.comm, t.pid, name))
+
+                            unregistered = False
+                            for p in close_wait_ports:
+                                if p in listen_ports:
+                                    unregistered = True
+                            yield t, unregistered
                             nodes.append(t)
-                            # print(mapping.l_name)
 
 
     def render_text(self, outfd, data):
-        for task in data:
-            outfd.write(str(task.comm)+"\n")
+        for task, unregistered in data:
+            if unregistered:
+                outfd.write(str(task.comm)+" (unregistered)\n")
+            else:
+                outfd.write(str(task.comm)+"\n")
